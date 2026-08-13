@@ -1626,6 +1626,7 @@ public:
     int64_t delayRemain = 0;
     const std::chrono::milliseconds frameDuration{ 10 };
     std::chrono::steady_clock::time_point lastTimestamp = std::chrono::steady_clock::now();
+    bool animClockArmed = false; // 动画计时器是否已启动(暂停/重新播放时需重新分配计时起点)
 
 
     void DrawScene() {
@@ -2094,8 +2095,12 @@ public:
         updateMainCanvas();
 
         if (curPar.imageAssetPtr->format == ImageFormat::Animated && curPar.isAnimationPause == false) {
-            if (delayRemain <= 0)
+            // 动画开始/恢复播放时重新确定计时起点，避免加载耗时或暂停时长被计入首帧
+            if (!animClockArmed) {
+                animClockArmed = true;
                 delayRemain = curPar.curFrameDelay;
+                lastTimestamp = std::chrono::steady_clock::now();
+            }
 
             auto nowTimestamp = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(nowTimestamp - lastTimestamp);
@@ -2105,8 +2110,8 @@ public:
                 std::this_thread::sleep_for(frameDuration - elapsed);
 
             delayRemain -= elapsed.count();
-            if (delayRemain <= 0) {
-                delayRemain = curPar.curFrameDelay;
+            // 累进推进帧，并保留余量，保证按帧延迟的真实时间播放，避免越来越慢
+            while (delayRemain <= 0) {
                 curPar.curFrameIdx++;
                 if (curPar.curFrameIdx > curPar.curFrameIdxMax) {
                     curPar.curFrameIdx = 0;
@@ -2116,9 +2121,14 @@ public:
                         curPar.imageAssetPtr->format = ImageFormat::Still;
                         curPar.Init(winWidth, winHeight);
                         operateQueue.push({ ActionENUM::refresh });
+                        break;
                     }
                 }
+                delayRemain += std::max(1, curPar.imageAssetPtr->frameDurations[curPar.curFrameIdx]);
             }
+        }
+        else {
+            animClockArmed = false; // 暂停或非动画状态时作废旧计时起点
         }
     }
 

@@ -314,17 +314,12 @@ std::vector<cv::Mat> DecodeVideoFrames(const uint8_t* videoBuffer, size_t size, 
         return frames;
     }
 
-    // 6. 准备颜色空间转换上下文 (YUV -> BGR)，并应用缩放
-    std::unique_ptr<SwsContext, SwsContextDeleter> swsCtx(sws_getContext(
-        srcWidth, srcHeight, codecCtx->pix_fmt,
-        dstWidth, dstHeight, AV_PIX_FMT_BGR24,
-        SWS_BILINEAR, nullptr, nullptr, nullptr
-    ));
-
-    if (!swsCtx) {
-        JARK_LOG("Failed to create SwsContext");
-        return frames;
-    }
+    // 6. 颜色空间转换上下文 (YUV -> BGR) 延迟到解码出首帧后创建：
+    //    部分码流在解码前无法确定像素格式 (codecCtx->pix_fmt == AV_PIX_FMT_NONE)，
+    //    直接用未知格式调用 sws_getContext 会触发 swscale 断言导致进程崩溃；
+    //    首帧的 frame->format 才是解码后实际可用的像素格式。
+    std::unique_ptr<SwsContext, SwsContextDeleter> swsCtx;
+    AVPixelFormat swsSrcFmt = AV_PIX_FMT_NONE;
 
     // 7. 准备帧和包
     std::unique_ptr<AVFrame, AvFrameDeleter> frame(av_frame_alloc());
@@ -359,59 +354,85 @@ std::vector<cv::Mat> DecodeVideoFrames(const uint8_t* videoBuffer, size_t size, 
     while (av_read_frame(formatCtx.get(), packet.get()) >= 0) {
         if (packet->stream_index == videoStreamIndex) {
             int sendResult = avcodec_send_packet(codecCtx.get(), packet.get());
-            if (sendResult < 0) {
+            if (sendResult < 0) { // 跳过损坏的数据包，继续尝试后续数据包
                 char errStr[AV_ERROR_MAX_STRING_SIZE] = { 0 };
                 JARK_LOG("Error sending packet: {}", av_make_error_string(errStr, sizeof(errStr), sendResult));
-                break;
             }
-
-            while (true) {
-                int receiveResult = avcodec_receive_frame(codecCtx.get(), frame.get());
-                if (receiveResult == AVERROR(EAGAIN) || receiveResult == AVERROR_EOF) {
-                    break;
-                }
-                else if (receiveResult < 0) {
-                    char errStr[AV_ERROR_MAX_STRING_SIZE] = { 0 };
-                    JARK_LOG("Error decoding frame: {}", av_make_error_string(errStr, sizeof(errStr), receiveResult));
-                    break;
-                }
-
-                // 9. 颜色转换 (YUV -> BGR) 并缩放
-                int scaledRows = sws_scale(swsCtx.get(), frame->data, frame->linesize, 0, srcHeight,
-                    rgbFrame->data, rgbFrame->linesize);
-                if (scaledRows <= 0) {
-                    JARK_LOG("Failed to convert video frame: {} rows scaled", scaledRows);
-                    continue;
-                }
-
-                // 10. 创建 cv::Mat (注意：OpenCV 使用 BGR)
-                // 数据是连续的，直接封装
-                cv::Mat decodedMat(dstHeight, dstWidth, CV_8UC3, rgbFrame->data[0]);
-
-                // 深拷贝数据，因为 rgbBuffer 会在下一帧被覆盖
-                cv::Mat finalMat = decodedMat.clone();
-
-                // 11. 处理旋转
-                if (rotation != 0) {
-                    int cvRotateCode = -1;
-                    int normRot = (rotation % 360 + 360) % 360;
-
-                    if (normRot == 90) {
-                        cvRotateCode = cv::ROTATE_90_CLOCKWISE;
+            else {
+                while (true) {
+                    int receiveResult = avcodec_receive_frame(codecCtx.get(), frame.get());
+                    if (receiveResult == AVERROR(EAGAIN) || receiveResult == AVERROR_EOF) {
+                        break;
                     }
-                    else if (normRot == 180) {
-                        cvRotateCode = cv::ROTATE_180;
-                    }
-                    else if (normRot == 270) {
-                        cvRotateCode = cv::ROTATE_90_COUNTERCLOCKWISE;
+                    else if (receiveResult < 0) {
+                        char errStr[AV_ERROR_MAX_STRING_SIZE] = { 0 };
+                        JARK_LOG("Error decoding frame: {}", av_make_error_string(errStr, sizeof(errStr), receiveResult));
+                        break;
                     }
 
-                    if (cvRotateCode >= 0) {
-                        cv::rotate(finalMat, finalMat, cvRotateCode);
+                    // 跳过无效帧或分辨率发生变化的帧（RGB 缓冲区按初始分辨率分配）
+                    if (frame->format == AV_PIX_FMT_NONE || frame->width <= 0 || frame->height <= 0) {
+                        JARK_LOG("Skip video frame with invalid format/size: fmt={} {}x{}",
+                            frame->format, frame->width, frame->height);
+                        continue;
                     }
-                }
+                    if (frame->width != srcWidth || frame->height != srcHeight) {
+                        JARK_LOG("Skip video frame with unexpected size: {}x{} (expected {}x{})",
+                            frame->width, frame->height, srcWidth, srcHeight);
+                        continue;
+                    }
 
-                frames.push_back(std::move(finalMat));
+                    // 9. 按需 (重)建颜色转换上下文 (YUV -> BGR) 并缩放
+                    auto srcFmt = static_cast<AVPixelFormat>(frame->format);
+                    if (!swsCtx || srcFmt != swsSrcFmt) {
+                        swsCtx.reset(sws_getContext(
+                            srcWidth, srcHeight, srcFmt,
+                            dstWidth, dstHeight, AV_PIX_FMT_BGR24,
+                            SWS_BILINEAR, nullptr, nullptr, nullptr
+                        ));
+                        swsSrcFmt = srcFmt;
+                        if (!swsCtx) {
+                            JARK_LOG("Failed to create SwsContext for pixel format: {}", (int)srcFmt);
+                            continue;
+                        }
+                    }
+
+                    int scaledRows = sws_scale(swsCtx.get(), frame->data, frame->linesize, 0, srcHeight,
+                        rgbFrame->data, rgbFrame->linesize);
+                    if (scaledRows <= 0) {
+                        JARK_LOG("Failed to convert video frame: {} rows scaled", scaledRows);
+                        continue;
+                    }
+
+                    // 10. 创建 cv::Mat (注意：OpenCV 使用 BGR)
+                    // 数据是连续的，直接封装
+                    cv::Mat decodedMat(dstHeight, dstWidth, CV_8UC3, rgbFrame->data[0]);
+
+                    // 深拷贝数据，因为 rgbBuffer 会在下一帧被覆盖
+                    cv::Mat finalMat = decodedMat.clone();
+
+                    // 11. 处理旋转
+                    if (rotation != 0) {
+                        int cvRotateCode = -1;
+                        int normRot = (rotation % 360 + 360) % 360;
+
+                        if (normRot == 90) {
+                            cvRotateCode = cv::ROTATE_90_CLOCKWISE;
+                        }
+                        else if (normRot == 180) {
+                            cvRotateCode = cv::ROTATE_180;
+                        }
+                        else if (normRot == 270) {
+                            cvRotateCode = cv::ROTATE_90_COUNTERCLOCKWISE;
+                        }
+
+                        if (cvRotateCode >= 0) {
+                            cv::rotate(finalMat, finalMat, cvRotateCode);
+                        }
+                    }
+
+                    frames.push_back(std::move(finalMat));
+                }
             }
         }
         av_packet_unref(packet.get());

@@ -2977,6 +2977,51 @@ static size_t getVideoSize(string_view exifStr) {
     return value;
 }
 
+// 某些厂商（如DJI）的实况照片会在视频数据后附加额外尾块，导致视频并不恰好位于文件末尾。
+// 在期望起点附近搜索合法的 MP4 'ftyp' 盒来定位真实视频起点；找不到则回退到原始切片。
+static std::span<const uint8_t> locateMotionPhotoVideo(std::span<const uint8_t> fileBuf, size_t videoSize) {
+    const size_t expectedStart = fileBuf.size() - videoSize;
+
+    auto isValidFtypBox = [&fileBuf](size_t boxStart) -> bool {
+        if (boxStart + 8 > fileBuf.size())
+            return false;
+        const uint8_t* p = fileBuf.data() + boxStart;
+        if (p[4] != 'f' || p[5] != 't' || p[6] != 'y' || p[7] != 'p')
+            return false;
+        const uint32_t boxSize = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+        return boxSize >= 8 && boxSize <= 4096 && boxStart + boxSize <= fileBuf.size();
+    };
+
+    if (isValidFtypBox(expectedStart)) // 起点已经对齐，无需修正
+        return fileBuf.subspan(expectedStart, videoSize);
+
+    constexpr size_t SEARCH_RANGE = 8192;
+    const size_t searchBegin = expectedStart > SEARCH_RANGE ? expectedStart - SEARCH_RANGE : 0;
+    const size_t searchEnd = std::min(expectedStart + SEARCH_RANGE, fileBuf.size() - 8);
+
+    size_t bestStart = std::numeric_limits<size_t>::max();
+    size_t bestDistance = std::numeric_limits<size_t>::max();
+    for (size_t pos = searchBegin; pos <= searchEnd; pos++) {
+        if (!isValidFtypBox(pos))
+            continue;
+        const size_t distance = pos > expectedStart ? pos - expectedStart : expectedStart - pos;
+        if (distance < bestDistance) { // 取距期望起点最近者
+            bestDistance = distance;
+            bestStart = pos;
+        }
+    }
+
+    if (bestStart == std::numeric_limits<size_t>::max()) {
+        JARK_LOG("MotionPhoto: MP4 start not found, fallback to the last {} bytes", videoSize);
+        return fileBuf.subspan(expectedStart, videoSize);
+    }
+
+    if (bestStart != expectedStart) {
+        JARK_LOG("MotionPhoto: adjust video start {} -> {} (videoSize: {})", expectedStart, bestStart, videoSize);
+    }
+    return fileBuf.subspan(bestStart, std::min(videoSize, fileBuf.size() - bestStart));
+}
+
 static std::vector<std::wstring> getVideoCandidatePaths(std::wstring_view imagePath) {
     const std::wstring fullPath(imagePath);
     const auto lastDot = fullPath.find_last_of(L'.');
@@ -3030,7 +3075,8 @@ ImageAsset ImageDatabase::loadMotionPhoto(wstring_view path, std::span<const uin
     auto videoSize = getVideoSize(exifInfo);
     std::vector<cv::Mat> frames;
     if (videoSize >= MIN_VIDEO_BUFF_SIZE && videoSize < fileBuf.size()) {
-        frames = DecodeVideoFrames(fileBuf.data() + fileBuf.size() - videoSize, videoSize);
+        auto videoBuf = locateMotionPhotoVideo(fileBuf, videoSize);
+        frames = DecodeVideoFrames(videoBuf.data(), videoBuf.size());
     }
     else {
         frames = decodeMotionPhotoSidecarVideo(path); // 苹果/VIVO等 独立视频文件的实况照片，尝试从同目录下的同名视频文件解码
